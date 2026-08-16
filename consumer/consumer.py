@@ -5,11 +5,19 @@ from confluent_kafka import Consumer, Producer
 import psycopg2
 
 
-# -----------------------------
-# Redpanda Consumer
-# -----------------------------
+# ============================================================
+# REDPANDA CONFIGURATION
+# ============================================================
+
+REDPANDA_SERVER = "localhost:19092"
+
+ORDERS_TOPIC = "orders"
+DLQ_TOPIC = "orders-dlq"
+
+
+# Main consumer
 consumer_config = {
-    "bootstrap.servers": "localhost:19092",
+    "bootstrap.servers": REDPANDA_SERVER,
     "group.id": "order-consumer-group",
     "auto.offset.reset": "earliest"
 }
@@ -17,22 +25,18 @@ consumer_config = {
 consumer = Consumer(consumer_config)
 
 
-# -----------------------------
-# Redpanda DLQ Producer
-# -----------------------------
+# Producer used to send failed events to DLQ
 dlq_producer_config = {
-    "bootstrap.servers": "localhost:19092"
+    "bootstrap.servers": REDPANDA_SERVER
 }
 
 dlq_producer = Producer(dlq_producer_config)
 
-ORDERS_TOPIC = "orders"
-DLQ_TOPIC = "orders-dlq"
 
+# ============================================================
+# POSTGRESQL CONFIGURATION
+# ============================================================
 
-# -----------------------------
-# PostgreSQL
-# -----------------------------
 db_config = {
     "host": "localhost",
     "port": 5432,
@@ -41,19 +45,30 @@ db_config = {
     "password": "password"
 }
 
+
 try:
     conn = psycopg2.connect(**db_config)
     cursor = conn.cursor()
+
     print("Connected to PostgreSQL.")
+
 except Exception as e:
     print(f"PostgreSQL connection failed: {e}")
     raise
 
 
-# -----------------------------
-# Validation
-# -----------------------------
+# ============================================================
+# ORDER VALIDATION
+# ============================================================
+
 def validate_order(order):
+    """
+    Validate incoming e-commerce order.
+    Returns:
+        (True, None) if valid
+        (False, reason) if invalid
+    """
+
     required_fields = [
         "order_id",
         "customer_id",
@@ -65,26 +80,46 @@ def validate_order(order):
         "timestamp"
     ]
 
+    # Check required fields
     for field in required_fields:
+
         if field not in order or order[field] in (None, ""):
             return False, f"Missing field: {field}"
 
-    if not isinstance(order["quantity"], int) or order["quantity"] <= 0:
+    # Check quantity
+    if (
+        not isinstance(order["quantity"], int)
+        or order["quantity"] <= 0
+    ):
         return False, "Quantity must be a positive integer"
 
-    if not isinstance(order["price"], (int, float)) or order["price"] <= 0:
+    # Check price
+    if (
+        not isinstance(order["price"], (int, float))
+        or order["price"] <= 0
+    ):
         return False, "Price must be a positive number"
 
     return True, None
 
 
-# -----------------------------
-# 5-minute window calculation
-# -----------------------------
+# ============================================================
+# 5-MINUTE WINDOW CALCULATION
+# ============================================================
+
 def get_window_start(timestamp):
+    """
+    Convert an event timestamp into the beginning
+    of its 5-minute window.
+
+    Example:
+        13:37:42 → 13:35:00
+        13:43:10 → 13:40:00
+    """
+
     dt = datetime.fromisoformat(timestamp)
 
-    # Make sure timestamp is timezone-aware
+    # Make timestamp timezone-aware if necessary
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
 
@@ -97,22 +132,26 @@ def get_window_start(timestamp):
     )
 
 
-# -----------------------------
-# Analytics state
-# -----------------------------
+# ============================================================
+# ANALYTICS STATE
+# ============================================================
+
 current_window_start = None
 order_count = 0
 total_revenue = 0.0
 
 
-# -----------------------------
-# Save completed analytics window
-# -----------------------------
+# ============================================================
+# SAVE ANALYTICS WINDOW
+# ============================================================
+
 def save_window_metrics(window_start, count, revenue):
+
     if window_start is None or count == 0:
         return
 
     window_end = window_start + timedelta(minutes=5)
+
     average_order_value = revenue / count
 
     query = """
@@ -125,6 +164,7 @@ def save_window_metrics(window_start, count, revenue):
             average_order_value
         )
         VALUES (%s, %s, %s, %s, %s)
+
         ON CONFLICT (window_start)
         DO UPDATE SET
             window_end = EXCLUDED.window_end,
@@ -147,7 +187,7 @@ def save_window_metrics(window_start, count, revenue):
     conn.commit()
 
     print(
-        f"\nAnalytics window completed:"
+        "\nAnalytics window completed:"
         f"\n  Window: {window_start} → {window_end}"
         f"\n  Orders: {count}"
         f"\n  Revenue: ₹{revenue:.2f}"
@@ -155,38 +195,55 @@ def save_window_metrics(window_start, count, revenue):
     )
 
 
-# -----------------------------
-# Subscribe to orders
-# -----------------------------
+# ============================================================
+# SUBSCRIBE TO ORDERS TOPIC
+# ============================================================
+
 consumer.subscribe([ORDERS_TOPIC])
 
 print("Consumer started...")
 print("Waiting for orders...\n")
 
 
+# ============================================================
+# MAIN CONSUMER LOOP
+# ============================================================
+
 try:
+
     while True:
 
         message = consumer.poll(1.0)
 
+        # No message available
         if message is None:
             continue
 
+        # Kafka/Redpanda error
         if message.error():
+
             print(f"Consumer error: {message.error()}")
+
             continue
 
-        # -----------------------------
-        # Parse JSON
-        # -----------------------------
+        # ====================================================
+        # PARSE JSON
+        # ====================================================
+
         try:
+
             order = json.loads(
                 message.value().decode("utf-8")
             )
+
         except json.JSONDecodeError:
 
-            print("Invalid JSON detected. Sending to DLQ.")
+            print(
+                "Invalid JSON detected. "
+                "Sending raw message to DLQ."
+            )
 
+            # Send raw invalid message to DLQ
             dlq_producer.produce(
                 DLQ_TOPIC,
                 value=message.value()
@@ -194,26 +251,61 @@ try:
 
             dlq_producer.flush()
 
+            # Record failure in PostgreSQL
+            cursor.execute(
+                """
+                INSERT INTO dlq_events
+                (
+                    order_id,
+                    error_reason
+                )
+                VALUES (%s, %s);
+                """,
+                (
+                    None,
+                    "Invalid JSON"
+                )
+            )
+
+            conn.commit()
+
+            print(
+                "→ Sent invalid JSON to orders-dlq "
+                "and recorded in dlq_events\n"
+            )
+
             continue
 
-        # -----------------------------
-        # Validate order
-        # -----------------------------
+        # ====================================================
+        # VALIDATE ORDER
+        # ====================================================
+
         valid, error_reason = validate_order(order)
+
+        # ====================================================
+        # INVALID ORDER
+        # ====================================================
 
         if not valid:
 
+            order_id = order.get(
+                "order_id",
+                "UNKNOWN"
+            )
+
             print(
                 f"INVALID ORDER: "
-                f"{order.get('order_id', 'UNKNOWN')} "
+                f"{order_id} "
                 f"| Reason: {error_reason}"
             )
 
+            # Create detailed DLQ record
             dlq_record = {
                 "error": error_reason,
                 "original_order": order
             }
 
+            # Send failed event to DLQ
             dlq_producer.produce(
                 DLQ_TOPIC,
                 value=json.dumps(dlq_record)
@@ -221,13 +313,42 @@ try:
 
             dlq_producer.flush()
 
-            print("→ Sent to orders-dlq\n")
+            # ----------------------------------------------
+            # Record DLQ event in PostgreSQL
+            # ----------------------------------------------
 
+            dlq_query = """
+                INSERT INTO dlq_events
+                (
+                    order_id,
+                    error_reason
+                )
+                VALUES (%s, %s);
+            """
+
+            cursor.execute(
+                dlq_query,
+                (
+                    order.get("order_id"),
+                    error_reason
+                )
+            )
+
+            conn.commit()
+
+            print(
+                "→ Sent to orders-dlq "
+                "and recorded in dlq_events\n"
+            )
+
+            # Do NOT store invalid order
+            # Do NOT include it in analytics
             continue
 
-        # -----------------------------
-        # Store valid order
-        # -----------------------------
+        # ====================================================
+        # VALID ORDER → STORE IN POSTGRESQL
+        # ====================================================
+
         insert_query = """
             INSERT INTO orders
             (
@@ -240,7 +361,18 @@ try:
                 city,
                 timestamp
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES
+            (
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s
+            )
+
             ON CONFLICT (order_id) DO NOTHING;
         """
 
@@ -267,45 +399,58 @@ try:
             f"₹{order['price']}"
         )
 
-        # -----------------------------
-        # Analytics
-        # -----------------------------
+        # ====================================================
+        # STREAMING ANALYTICS
+        # ====================================================
+
         order_timestamp = get_window_start(
             order["timestamp"]
         )
 
-        # First order
+        # First valid order
         if current_window_start is None:
+
             current_window_start = order_timestamp
 
-        # New window detected
+        # Newer 5-minute window detected
         elif order_timestamp > current_window_start:
 
+            # Save previous window
             save_window_metrics(
                 current_window_start,
                 order_count,
                 total_revenue
             )
 
+            # Start new window
             current_window_start = order_timestamp
+
             order_count = 0
             total_revenue = 0.0
 
-        # Update current window
+        # Add valid order to current window
         order_count += 1
+
         total_revenue += (
             order["price"] * order["quantity"]
         )
 
+        # Let DLQ delivery callbacks execute
         dlq_producer.poll(0)
 
 
+# ============================================================
+# CLEAN SHUTDOWN
+# ============================================================
+
 except KeyboardInterrupt:
-    print("\nConsumer stopped.")
+
+    print("\nConsumer stopped by user.")
+
 
 finally:
 
-    # Save the final partially completed window
+    # Save final partially completed window
     save_window_metrics(
         current_window_start,
         order_count,
@@ -313,7 +458,9 @@ finally:
     )
 
     consumer.close()
+
     cursor.close()
+
     conn.close()
 
     print("Connections closed.")
