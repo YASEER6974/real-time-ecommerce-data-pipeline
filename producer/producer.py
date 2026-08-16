@@ -6,7 +6,9 @@ from datetime import datetime, timezone
 from confluent_kafka import Producer
 
 
-# Redpanda connection
+# -----------------------------
+# Redpanda configuration
+# -----------------------------
 config = {
     "bootstrap.servers": "localhost:19092"
 }
@@ -16,6 +18,9 @@ producer = Producer(config)
 TOPIC = "orders"
 
 
+# -----------------------------
+# Delivery confirmation
+# -----------------------------
 def delivery_report(err, msg):
     if err is not None:
         print(f"Delivery failed: {err}")
@@ -26,6 +31,9 @@ def delivery_report(err, msg):
         )
 
 
+# -----------------------------
+# Product catalogue
+# -----------------------------
 products = [
     ("Laptop", "Electronics", 55000),
     ("Headphones", "Electronics", 2500),
@@ -36,6 +44,9 @@ products = [
 ]
 
 
+# -----------------------------
+# Generate orders continuously
+# -----------------------------
 while True:
 
     product, category, price = random.choice(products)
@@ -53,16 +64,49 @@ while True:
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
+    # ---------------------------------
+    # Generate invalid event occasionally
+    # ---------------------------------
+    if random.random() < 0.10:
+
+        invalid_type = random.choice([
+            "negative_price",
+            "zero_quantity",
+            "missing_customer",
+            "missing_product"
+        ])
+
+        if invalid_type == "negative_price":
+            order["price"] = -500
+
+        elif invalid_type == "zero_quantity":
+            order["quantity"] = 0
+
+        elif invalid_type == "missing_customer":
+            order["customer_id"] = None
+
+        elif invalid_type == "missing_product":
+            order["product"] = ""
+
+        print(
+            f"\n⚠️ Generated INVALID order "
+            f"({invalid_type}): {order}"
+        )
+
+    else:
+        print(f"\nGenerated VALID order: {order}")
+
+    # Convert Python dictionary to JSON
     message = json.dumps(order)
 
+    # Send event to Redpanda
     producer.produce(
         TOPIC,
         value=message,
         callback=delivery_report
     )
 
+    # Allow delivery callback to execute
     producer.poll(0)
-
-    print(f"Produced: {message}")
 
     time.sleep(2)
