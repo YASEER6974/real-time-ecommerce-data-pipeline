@@ -3,6 +3,11 @@ import time
 import random
 from datetime import datetime, timezone
 
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from confluent_kafka import Producer
 
 
@@ -10,7 +15,7 @@ from confluent_kafka import Producer
 # Redpanda configuration
 # -----------------------------
 config = {
-    "bootstrap.servers": "localhost:19092"
+    "bootstrap.servers": os.getenv("REDPANDA_BOOTSTRAP_SERVERS")
 }
 
 producer = Producer(config)

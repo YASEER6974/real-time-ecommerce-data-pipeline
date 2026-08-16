@@ -1,15 +1,19 @@
 import json
+import os
 from datetime import datetime, timedelta, timezone
 
+from dotenv import load_dotenv
 from confluent_kafka import Consumer, Producer
 import psycopg2
+
+load_dotenv()
 
 
 # ============================================================
 # REDPANDA CONFIGURATION
 # ============================================================
 
-REDPANDA_SERVER = "localhost:19092"
+REDPANDA_SERVER = os.getenv("REDPANDA_BOOTSTRAP_SERVERS")
 
 ORDERS_TOPIC = "orders"
 DLQ_TOPIC = "orders-dlq"
@@ -38,11 +42,11 @@ dlq_producer = Producer(dlq_producer_config)
 # ============================================================
 
 db_config = {
-    "host": "localhost",
-    "port": 5432,
-    "database": "ecommerce",
-    "user": "user",
-    "password": "password"
+    "host": os.getenv("POSTGRES_HOST"),
+    "port": int(os.getenv("POSTGRES_PORT", "5432")),
+    "database": os.getenv("POSTGRES_DB"),
+    "user": os.getenv("POSTGRES_USER"),
+    "password": os.getenv("POSTGRES_PASSWORD")
 }
 
 
